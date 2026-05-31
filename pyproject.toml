@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studio2ga4gh"
+version = "0.1.0"
+description = "Convert Pedigree Studio sessions to GA4GH Pedigree Standard and Phenopackets"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+keywords = ["pedigree", "ga4gh", "phenopackets", "genetics", "clinical-genetics", "interoperability"]
+authors = [
+    {name = "Tim Hearn", email = "tjh70@cam.ac.uk"},
+]
+
+[project.scripts]
+studio2ga4gh = "studio2ga4gh.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/comparativechrono/studio2ga4gh"
+Issues = "https://github.com/comparativechrono/studio2ga4gh/issues"
+
+[tool.setuptools.packages.find]
+include = ["studio2ga4gh*"]
