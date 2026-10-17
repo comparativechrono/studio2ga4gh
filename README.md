@@ -38,12 +38,20 @@ anything that needs attention, such as a condition without an ontology term.
 | Option | What it does |
 |---|---|
 | `-t`, `--terms FILE` | Matches the condition names in the drawing's colour key to ontology terms (see below). |
+| `-o NAME`, `-d FOLDER` | The start of the files' names (default: the drawing's), and the folder to write them in (default: beside the drawing; made if it does not exist). |
 | `--ids numbers` | Names people by their pedigree numbers, as Pedigree Studio shows them (II-3). The default. |
 | `--ids drawing` | Uses the labels shown in the drawing instead, which may be names. |
 | `--ids studio` | Uses Pedigree Studio's internal ids. |
 | `--only pedigree`, `--only family` | Writes only one of the two files. |
 | `--family-id ID` | The family's id (default `FAM1`, `FAM2` …). |
 | `--created-by TEXT` | What goes in `metaData.createdBy` (default `studio2ga4gh 0.4.0`). |
+
+With `--ids drawing` or `--ids studio`, a label becomes an id as studio2ped
+makes one: spaces become underscores and other punctuation is dropped, so "J.
+Mensah" is `J_Mensah` in the GA4GH files and in studio2ped's PED file alike.
+An id that would be empty, `0` (which a PED-style pedigree reads as "no
+parent") or shared with someone else falls back to the person's pedigree
+number, with a note.
 
 ### Ontology terms for the conditions
 
@@ -57,12 +65,16 @@ the colour key needs a term. Give them in a terms file:
 }
 ```
 
-or write the id in the colour key itself: `Breast cancer [MONDO:0007254]`.
-Names are matched without regard to case, and the mapping files of hponorm and
-mondonorm (`--mapping`) and the decision files of `phenotk normalise` work as
-terms files too. An HPO term makes the condition a phenotypic feature and any
-other term (Mondo, OMIM, Orphanet) a disease; a `"kind"` of `"disease"` or
-`"phenotype"` in the terms file overrides that.
+or write the id in the colour key itself: `Breast cancer [MONDO:0007254]`. Only
+the id of an ontology that pedigree-ga4gh can declare counts (the HPO, Mondo,
+OMIM, Orphanet, the Disease Ontology, SNOMED CT, ICD-10-CM and others):
+anything else in brackets, such as `Hypertension (BP:160/95)`, is part of the
+name. Names are matched without regard to case,
+and the mapping files of hponorm and mondonorm (`--mapping`) and the decision
+files of `phenotk normalise` work as terms files too. An HPO term makes the
+condition a phenotypic feature and any other term (Mondo, OMIM, Orphanet) a
+disease; a `"kind"` of `"disease"` or `"phenotype"` in the terms file overrides
+that.
 
 A condition without a term is **left out**, with a note, rather than written
 with an empty id. hponorm, mondonorm or the Pedigree workbench's *Match
@@ -128,7 +140,8 @@ through pedigree-ga4gh instead. Files from 0.3 can be converted with
 - conditions without an ontology term are left out, with a note;
 - `--phenotypes` is still accepted, but changes nothing: whether a condition
   is a disease or a phenotype now follows its term. `--include-names` is now
-  the same as `--ids drawing`.
+  the same as `--ids drawing`, whose ids are the drawing's labels and so may
+  be names.
 
 See [CHANGELOG.md](CHANGELOG.md).
 

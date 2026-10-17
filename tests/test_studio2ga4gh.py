@@ -132,6 +132,45 @@ def test_notes_keep_ids_as_they_are():
     assert all(c.upper() not in narrative.split() for c in carriers)
 
 
+def test_only_an_ontologys_id_in_the_key_counts():
+    """An id in brackets after a condition counts only if pedigree-ga4gh can declare its ontology: a blood
+    pressure in brackets is part of the name, so the condition is left out as unmatched, not given an id."""
+    from studio2ga4gh.converter import split_key_label
+    assert split_key_label("Breast cancer [MONDO:0007254]") == ("Breast cancer", "MONDO:0007254")
+    assert split_key_label("Deafness (hp:0000365)") == ("Deafness", "HP:0000365")
+    assert split_key_label("Hypertension (BP:160/95)") == ("Hypertension (BP:160/95)", None)
+    drawing = session("price")
+    first = next(iter(drawing["legendLabels"]))
+    drawing["legendLabels"][first] = "Hypertension (BP:160/95)"
+    r = studio2ga4gh.convert(drawing, "price", created=CREATED)
+    assert "Hypertension (BP:160/95)" in r.unmatched
+    for _, text in r.files:
+        assert "BP:160" not in text.replace("Hypertension (BP:160/95)", "") and errors(loads(text)) == []
+
+
+def test_labels_become_ids_as_in_studio2ped():
+    """--ids drawing and --ids studio make ids from labels by studio2ped's rule (J. Mensah -> J_Mensah); an id
+    that would be empty, 0 or shared falls back to the pedigree number, with a note."""
+    from studio2ga4gh.converter import make_id
+    assert make_id("J. Mensah") == "J_Mensah" and make_id("  Ama  Owusu (b. 1950) ") == "Ama_Owusu_b_1950"
+    person = lambda pid, shape, x, y, label: {"id": pid, "shape": shape, "x": x, "y": y, "customLabel": label}
+    drawing = {"numberingMode": "freetext", "persons": [
+        person("f", "male", 0, 0, "J. Mensah"), person("m", "female", 100, 0, "0"),
+        person("c1", "male", 0, 150, "Kid"), person("c2", "female", 100, 150, "Kid"),
+        person("c3", "male", 200, 150, "?!")],
+        "partnerships": [{"id": "pr", "fromId": "f", "toId": "m"}],
+        "childLinks": [{"id": "l" + c, "partnershipId": "pr", "childId": c} for c in ("c1", "c2", "c3")]}
+    r = studio2ga4gh.convert(drawing, "t", ids="drawing", created=CREATED)
+    fam = loads(r.files[1][1])
+    persons = {p["individualId"]: p for p in fam["pedigree"]["persons"]}
+    assert set(persons) == {"J_Mensah", "I-2", "II-1", "II-2", "II-3"}
+    assert persons["II-1"]["paternalId"] == "J_Mensah" and persons["II-1"]["maternalId"] == "I-2"
+    assert errors(fam) == [] and errors(loads(r.files[0][1])) == []
+    assert any("labelled 0" in w for w in r.warnings)
+    assert any("'Kid'" in w for w in r.warnings)
+    assert any("II-3's label" in w for w in r.warnings)
+
+
 def test_names_are_never_written():
     for name in EXAMPLES + ["features"]:
         drawing = session(name)
@@ -168,3 +207,13 @@ def test_command_line(tmp_path):
     assert code == 0 and os.path.exists(os.path.join(tmp_path, "old_ga4gh-pedigree.json"))
     code, out, err = run_cli(os.path.join(DATA, "no-such-file.json"))
     assert code == 1 and "cannot find" in err
+    # a folder that does not exist yet is made
+    code, out, err = run_cli(src, "-d", str(tmp_path / "new" / "folder"))
+    assert code == 0 and os.path.exists(os.path.join(tmp_path, "new", "folder", "okafor_ga4gh-pedigree.json"))
+    # a terms file that is missing or not JSON gives a message, not a traceback
+    code, out, err = run_cli(src, "-d", str(tmp_path), "-t", str(tmp_path / "no-terms.json"))
+    assert code == 1 and "cannot find the terms file" in err
+    bad = tmp_path / "bad-terms.json"
+    bad.write_text("{not json", encoding="utf-8")
+    code, out, err = run_cli(src, "-d", str(tmp_path), "-t", str(bad))
+    assert code == 1 and "could not read the terms file" in err
