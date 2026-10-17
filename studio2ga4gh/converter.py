@@ -1,11 +1,35 @@
-"""
-studio2ga4gh - Convert Pedigree Studio sessions to GA4GH Pedigree and Phenopackets.
+"""Convert a Pedigree Studio drawing to a GA4GH Pedigree and a Phenopackets Family.
 
-Produces two interoperability formats:
-1. GA4GH Pedigree (relationship-graph model with KIN ontology codes)
-2. Phenopackets Family (PED-compatible pedigree + disease information)
-"""
+The drawing is read into a :class:`pedigree_ga4gh.Kindred` (one per separate
+family on the canvas) and written out by pedigree-ga4gh, the one
+implementation of GA4GH output that the lab's pedigree tools share. This module
+only decides what each symbol and line in the drawing means:
 
+========================================  ==============================================
+In Pedigree Studio                        In the GA4GH files
+========================================  ==============================================
+square, circle, diamond                   sex MALE, FEMALE, UNKNOWN_SEX
+slash (deceased)                          vitalStatus DECEASED (otherwise ALIVE)
+arrow (proband)                           indexPatients; the Family's proband
+fill, halves, quarters, shading           a disease or phenotype for each condition named
+                                          in the colour key, once it has an ontology term
+child line from a couple                  isBiologicalMotherOf / isBiologicalFatherOf
+                                          (isBiologicalParentOf if the parent's sex is unknown)
+dashed child line                         isAdoptiveParentOf
+D in a parent's symbol                    isSpermDonorOf / isOvumDonorOf
+S in a parent's symbol                    isGestationalCarrierOf (not a biological parent)
+identical / non-identical twins           isMonozygotic- / isPolyzygoticMultipleBirthSiblingOf
+consanguineous couple                     isConsanguineousPartnerOf
+separated couple                          isSeparatedPartnerOf
+couple without children                   isPartnerOf
+pregnancy loss (triangle)                 a member with vitalStatus DECEASED, noted in the narrative
+"no children" and "infertility" bars      not people: noted in the narrative
+carrier dot, presymptomatic line, P       noted in the narrative (no ontology term exists)
+========================================  ==============================================
+
+Names and other notes written under symbols are not exported: Phenopackets
+have no field for a name, and such notes are often personal data.
+"""
 from __future__ import annotations
 
 import json
@@ -14,647 +38,330 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
-__version__ = "0.1.0"
+from pedigree_ga4gh import (DISEASE, PHENOTYPE, Kindred, Member, Relation, Term, kin, ontology,
+                            to_ga4gh_pedigree, to_phenopackets_family)
+from pedigree_ga4gh.io import dumps
 
-# ── KIN Ontology codes ───────────────────────────────────────────────────
-KIN_BIOLOGICAL_MOTHER_OF = {"id": "KIN:027", "label": "isBiologicalMotherOf"}
-KIN_BIOLOGICAL_FATHER_OF = {"id": "KIN:028", "label": "isBiologicalFatherOf"}
-KIN_ADOPTIVE_PARENT_OF = {"id": "KIN:022", "label": "isAdoptiveParentOf"}
-KIN_MONOZYGOTIC_TWIN = {"id": "KIN:010", "label": "isMonozygoticMultipleBirthSiblingOf"}
-KIN_DIZYGOTIC_TWIN = {"id": "KIN:011", "label": "isDizygoticMultipleBirthSiblingOf"}
+from . import __version__
+from .session import Session, StudioPerson, parse
 
-# ── Sex mappings ──────────────────────────────────────────────────────────
-SHAPE_TO_SEX_CODE = {
-    "male": 1, "female": 2, "unknown": 0,
-    "adopted-male": 1, "adopted-female": 2, "adopted-unknown": 0,
-    "miscarriage": 0, "no-offspring": 0, "infertile": 0,
-}
-SEX_CODE_TO_GA4GH = {1: "MALE", 2: "FEMALE", 0: "UNKNOWN_SEX"}
-SEX_CODE_TO_PHENOPACKET = {1: "MALE", 2: "FEMALE", 0: "UNKNOWN_SEX"}
+CREATED_BY = "studio2ga4gh " + __version__
 
-# ── Phenopacket affected status ──────────────────────────────────────────
-AFFECTED_STATUS = {"MISSING": "MISSING", "UNAFFECTED": "UNAFFECTED", "AFFECTED": "AFFECTED"}
-
-
-# ── Session data models ──────────────────────────────────────────────────
-
-@dataclass
-class Person:
-    id: str
-    shape: str
-    sex: int
-    text: str
-    fill_mode: str
-    fill_color: Optional[str]
-    halves: list
-    quarters: list
-    shading_pattern: str
-    shading_coverage: str
-    center_text: str
-    deceased: bool
-    proband: bool
-    custom_label: str
-    father_id: Optional[str] = None
-    mother_id: Optional[str] = None
-    family_id: Optional[str] = None
-    is_adopted: bool = False  # derived from dashed child link
-
-
-@dataclass
-class Partnership:
-    id: str
-    from_id: str
-    to_id: str
-    type: str
-
-
-@dataclass
-class ChildLink:
-    id: str
-    partnership_id: str
-    child_id: str
-    dashed: bool
-
-
-@dataclass
-class TwinLink:
-    id: str
-    child1_id: str
-    child2_id: str
-    type: str  # 'identical' or 'non-identical'
-    partnership_id: str
-
-
-@dataclass
-class Phenotype:
-    name: str
-    key: str
-    is_shading: bool
-    color: Optional[str]
-    pattern: Optional[str]
-    coverage: Optional[str]
-
-
-@dataclass
-class Family:
-    family_id: str
-    person_ids: set
-    persons: dict
-    partnerships: list
-    child_links: list
-    twin_links: list
-
-
-# ── Session parser ────────────────────────────────────────────────────────
-
-def parse_session(data: dict) -> tuple:
-    """Parse Pedigree Studio session JSON. Returns (persons, partnerships, child_links, twin_links, legend_labels)."""
-    persons = {}
-    for pd in data.get("persons", []):
-        pid = pd["id"]
-        persons[pid] = Person(
-            id=pid, shape=pd.get("shape", "unknown"),
-            sex=SHAPE_TO_SEX_CODE.get(pd.get("shape", "unknown"), 0),
-            text=pd.get("text", ""),
-            fill_mode=pd.get("fillMode", "none"),
-            fill_color=pd.get("fillColor"),
-            halves=pd.get("halves", [None, None]),
-            quarters=pd.get("quarters", [None, None, None, None]),
-            shading_pattern=pd.get("shadingPattern", "stripes"),
-            shading_coverage=pd.get("shadingCoverage", "full"),
-            center_text=pd.get("centerText", ""),
-            deceased=pd.get("deceased", False),
-            proband=pd.get("proband", False),
-            custom_label=pd.get("customLabel", ""),
-        )
-
-    partnerships = [Partnership(id=p["id"], from_id=p["fromId"], to_id=p["toId"],
-                    type=p.get("type", "normal")) for p in data.get("partnerships", [])]
-
-    child_links = [ChildLink(id=c["id"], partnership_id=c["partnershipId"],
-                   child_id=c["childId"], dashed=c.get("dashed", False))
-                   for c in data.get("childLinks", [])]
-
-    twin_links = [TwinLink(id=t["id"], child1_id=t["child1Id"], child2_id=t["child2Id"],
-                  type=t.get("type", "identical"), partnership_id=t.get("partnershipId", ""))
-                  for t in data.get("twinLinks", [])]
-
-    legend_labels = data.get("legendLabels", {})
-    return persons, partnerships, child_links, twin_links, legend_labels
-
-
-# ── Graph analysis (reused from studio2ped) ───────────────────────────────
-
-def detect_families(persons, partnerships, child_links, twin_links):
-    adj = defaultdict(set)
-    pship_map = {p.id: p for p in partnerships}
-
-    for p in partnerships:
-        if p.from_id in persons and p.to_id in persons:
-            adj[p.from_id].add(p.to_id)
-            adj[p.to_id].add(p.from_id)
-
-    for cl in child_links:
-        pship = pship_map.get(cl.partnership_id)
-        if pship and cl.child_id in persons:
-            for pid in (pship.from_id, pship.to_id):
-                if pid in persons:
-                    adj[cl.child_id].add(pid)
-                    adj[pid].add(cl.child_id)
-
-    for tl in twin_links:
-        if tl.child1_id in persons and tl.child2_id in persons:
-            adj[tl.child1_id].add(tl.child2_id)
-            adj[tl.child2_id].add(tl.child1_id)
-
-    visited = set()
-    families = []
-    fam_counter = 0
-
-    for pid in persons:
-        if pid in visited:
-            continue
-        fam_counter += 1
-        component = set()
-        queue = [pid]
-        while queue:
-            current = queue.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
-            component.add(current)
-            for n in adj.get(current, set()):
-                if n not in visited:
-                    queue.append(n)
-
-        fam_partnerships = [p for p in partnerships if p.from_id in component or p.to_id in component]
-        fam_child_links = [cl for cl in child_links if cl.child_id in component]
-        fam_twin_links = [tl for tl in twin_links
-                         if tl.child1_id in component or tl.child2_id in component]
-        fam_persons = {pid: persons[pid] for pid in component}
-
-        families.append(Family(
-            family_id=f"FAM{fam_counter}", person_ids=component,
-            persons=fam_persons, partnerships=fam_partnerships,
-            child_links=fam_child_links, twin_links=fam_twin_links,
-        ))
-    return families
-
-
-def resolve_parents(family):
-    pship_map = {p.id: p for p in family.partnerships}
-    for cl in family.child_links:
-        pship = pship_map.get(cl.partnership_id)
-        if not pship:
-            continue
-        child = family.persons.get(cl.child_id)
-        if not child:
-            continue
-        p1 = family.persons.get(pship.from_id)
-        p2 = family.persons.get(pship.to_id)
-        if not p1 or not p2:
-            continue
-        if p1.sex == 1 and p2.sex == 2:
-            child.father_id, child.mother_id = p1.id, p2.id
-        elif p1.sex == 2 and p2.sex == 1:
-            child.father_id, child.mother_id = p2.id, p1.id
-        else:
-            child.father_id, child.mother_id = pship.from_id, pship.to_id
-        if cl.dashed:
-            child.is_adopted = True
-    for p in family.persons.values():
-        p.family_id = family.family_id
-
-
-# ── ID and phenotype helpers ──────────────────────────────────────────────
-
-def make_individual_id(person):
-    if person.custom_label and person.custom_label.strip() and person.custom_label.strip() != "Lbl":
-        raw = person.custom_label.strip()
-    elif person.text and person.text.strip():
-        raw = person.text.strip().split("\n")[0].strip()
-    else:
-        raw = person.id
-    sanitised = re.sub(r"\s+", "_", raw)
-    sanitised = re.sub(r"[^\w\-]", "", sanitised)
-    return sanitised or person.id
-
-
-def extract_phenotypes(legend_labels):
-    phenotypes = []
-    for key, label in legend_labels.items():
-        if not label or not label.strip():
-            continue
-        label = label.strip()
-        if key.startswith("shading:"):
-            parts = key.split(":")
-            phenotypes.append(Phenotype(name=label, key=key, is_shading=True,
-                color=None, pattern=parts[1] if len(parts) > 1 else "stripes",
-                coverage=parts[2] if len(parts) > 2 else "full"))
-        else:
-            phenotypes.append(Phenotype(name=label, key=key, is_shading=False,
-                color=key, pattern=None, coverage=None))
-    return phenotypes
-
-
-def is_person_affected(person, phenotypes):
-    """Check if a person is affected for any phenotype. Returns True/False."""
-    if person.fill_mode == "solid" and person.fill_color:
-        for ph in phenotypes:
-            if not ph.is_shading and ph.color == person.fill_color:
-                return True
-    if person.fill_mode == "half":
-        for c in (person.halves or []):
-            if c:
-                for ph in phenotypes:
-                    if not ph.is_shading and ph.color == c:
-                        return True
-    if person.fill_mode == "quartered":
-        for c in (person.quarters or []):
-            if c:
-                for ph in phenotypes:
-                    if not ph.is_shading and ph.color == c:
-                        return True
-    if person.fill_mode == "shading":
-        shading_key = f"shading:{person.shading_pattern}:{person.shading_coverage}"
-        for ph in phenotypes:
-            if ph.is_shading and (ph.key == shading_key or ph.pattern == person.shading_pattern):
-                return True
-    return False
-
-
-def get_person_diseases(person, phenotypes):
-    """Return list of disease label strings this person is affected with."""
-    diseases = []
-    colours = set()
-    if person.fill_mode == "solid" and person.fill_color:
-        colours.add(person.fill_color)
-    elif person.fill_mode == "half":
-        for c in (person.halves or []):
-            if c:
-                colours.add(c)
-    elif person.fill_mode == "quartered":
-        for c in (person.quarters or []):
-            if c:
-                colours.add(c)
-
-    for ph in phenotypes:
-        if not ph.is_shading and ph.color in colours:
-            diseases.append(ph.name)
-        elif ph.is_shading and person.fill_mode == "shading":
-            if ph.pattern == person.shading_pattern:
-                diseases.append(ph.name)
-
-    return diseases
-
-
-# ── GA4GH Pedigree output ────────────────────────────────────────────────
-
-def build_ga4gh_pedigree(family, phenotypes, id_map, include_names=False):
-    """Build a GA4GH Pedigree Standard JSON document."""
-    pship_map = {p.id: p for p in family.partnerships}
-
-    # Build individuals
-    individuals = []
-    for p in sorted(family.persons.values(), key=lambda x: x.id):
-        ind = {
-            "id": id_map[p.id],
-            "sex": SEX_CODE_TO_GA4GH.get(p.sex, "UNKNOWN_SEX"),
-        }
-        # Name and DOB from annotation text — only if include_names is True
-        if include_names and p.text and p.text.strip():
-            parts = p.text.strip().split("\n")
-            ind["name"] = parts[0].strip()
-            for part in parts:
-                dob_match = re.search(r"b\.\s*(\d{4})", part)
-                if dob_match:
-                    ind["dateOfBirth"] = dob_match.group(1)
-
-        if p.deceased:
-            ind["deceased"] = True
-
-        if is_person_affected(p, phenotypes):
-            ind["affected"] = True
-
-        individuals.append(ind)
-
-    # Build relationships
-    relationships = []
-    for cl in family.child_links:
-        pship = pship_map.get(cl.partnership_id)
-        if not pship:
-            continue
-        child = family.persons.get(cl.child_id)
-        if not child:
-            continue
-
-        child_iid = id_map[cl.child_id]
-
-        # Mother relationship
-        if child.mother_id and child.mother_id in id_map:
-            mother = family.persons.get(child.mother_id)
-            if cl.dashed:
-                rel = dict(KIN_ADOPTIVE_PARENT_OF)
-            else:
-                rel = dict(KIN_BIOLOGICAL_MOTHER_OF)
-            relationships.append({
-                "individual": id_map[child.mother_id],
-                "relation": rel,
-                "relative": child_iid,
-            })
-
-        # Father relationship
-        if child.father_id and child.father_id in id_map:
-            if cl.dashed:
-                rel = dict(KIN_ADOPTIVE_PARENT_OF)
-            else:
-                rel = dict(KIN_BIOLOGICAL_FATHER_OF)
-            relationships.append({
-                "individual": id_map[child.father_id],
-                "relation": rel,
-                "relative": child_iid,
-            })
-
-    # Twin relationships
-    for tl in family.twin_links:
-        if tl.child1_id in id_map and tl.child2_id in id_map:
-            if tl.type == "identical":
-                rel = dict(KIN_MONOZYGOTIC_TWIN)
-            else:
-                rel = dict(KIN_DIZYGOTIC_TWIN)
-            relationships.append({
-                "individual": id_map[tl.child1_id],
-                "relation": rel,
-                "relative": id_map[tl.child2_id],
-            })
-
-    # Index patients (probands)
-    index_patients = [id_map[p.id] for p in family.persons.values() if p.proband]
-
-    pedigree = {
-        "id": family.family_id,
-        "individuals": individuals,
-        "relationships": relationships,
-        "date": date.today().isoformat(),
-    }
-    if index_patients:
-        pedigree["indexPatients"] = index_patients
-
-    # Add narrative
-    pheno_desc = ", ".join(ph.name for ph in phenotypes) if phenotypes else "unspecified"
-    pedigree["narrative"] = (
-        f"GA4GH Pedigree with {len(individuals)} individuals. "
-        f"Conditions tracked: {pheno_desc}."
-    )
-
-    return pedigree
-
-
-# ── Phenopackets output ──────────────────────────────────────────────────
-
-def _make_disease_term(label: str) -> dict:
-    """Create a Phenopackets Disease element from a free-text label.
-
-    The OntologyClass `term` uses the label as-is with an empty `id` field.
-    For full Phenopackets compliance, downstream tools should map these labels
-    to ontology terms (OMIM, Orphanet, MONDO, etc.).
-    """
-    return {
-        "term": {"id": "", "label": label},
-    }
-
-
-def _make_phenotypic_feature(label: str) -> dict:
-    """Create a Phenopackets PhenotypicFeature element from a free-text label.
-
-    The OntologyClass `type` uses the label as-is with an empty `id` field.
-    For full Phenopackets compliance, downstream tools should map these labels
-    to HPO terms (e.g. HP:0000520).
-    """
-    return {
-        "type": {"id": "", "label": label},
-    }
-
-
-def build_phenopackets_family(family, phenotypes, id_map, use_phenotypic_features=False):
-    """Build a Phenopackets Family JSON document.
-
-    Contains:
-    - A PED-compatible Pedigree (list of Person records)
-    - Disease or phenotypic feature information extracted from the legend
-    - Proband Phenopacket
-
-    Parameters
-    ----------
-    use_phenotypic_features : bool
-        If True, conditions are recorded as phenotypicFeatures (HPO-style)
-        instead of diseases (OMIM/MONDO-style).
-    """
-    # Helper to create the right element type
-    def make_condition(label):
-        if use_phenotypic_features:
-            return _make_phenotypic_feature(label)
-        return _make_disease_term(label)
-
-    # Field name in the Phenopacket
-    conditions_field = "phenotypicFeatures" if use_phenotypic_features else "diseases"
-    # Build PED-compatible pedigree
-    ped_persons = []
-    for p in sorted(family.persons.values(), key=lambda x: x.id):
-        iid = id_map[p.id]
-        father = id_map.get(p.father_id, "0") if p.father_id else "0"
-        mother = id_map.get(p.mother_id, "0") if p.mother_id else "0"
-
-        affected = is_person_affected(p, phenotypes)
-        status = "AFFECTED" if affected else "UNAFFECTED"
-
-        ped_persons.append({
-            "familyId": family.family_id,
-            "individualId": iid,
-            "paternalId": father,
-            "maternalId": mother,
-            "sex": SEX_CODE_TO_PHENOPACKET.get(p.sex, "UNKNOWN_SEX"),
-            "affectedStatus": status,
-        })
-
-    pedigree_block = {"persons": ped_persons}
-
-    # Check consanguinity
-    consanguinous = any(ps.type == "consanguineous" for ps in family.partnerships)
-
-    # Find proband
-    proband_person = None
-    for p in family.persons.values():
-        if p.proband:
-            proband_person = p
-            break
-    # Fallback: first affected individual
-    if not proband_person:
-        for p in family.persons.values():
-            if is_person_affected(p, phenotypes):
-                proband_person = p
-                break
-    # Fallback: first individual
-    if not proband_person and family.persons:
-        proband_person = next(iter(family.persons.values()))
-
-    # Build proband phenopacket
-    proband_phenopacket = None
-    if proband_person:
-        proband_subject = {
-            "id": id_map[proband_person.id],
-            "sex": SEX_CODE_TO_PHENOPACKET.get(proband_person.sex, "UNKNOWN_SEX"),
-        }
-        if proband_person.deceased:
-            proband_subject["vitalStatus"] = {"status": "DECEASED"}
-
-        proband_conditions = [make_condition(d) for d in get_person_diseases(proband_person, phenotypes)]
-
-        proband_phenopacket = {
-            "id": f"{family.family_id}-proband",
-            "subject": proband_subject,
-        }
-        if proband_conditions:
-            proband_phenopacket[conditions_field] = proband_conditions
-
-    # Build relative phenopackets — ONLY for affected relatives with disease info.
-    # Unaffected relatives and deceased-but-unaffected individuals do not need
-    # their own Phenopackets — their status is already in the pedigree block.
-    relatives = []
-    for p in sorted(family.persons.values(), key=lambda x: x.id):
-        if proband_person and p.id == proband_person.id:
-            continue
-        diseases = get_person_diseases(p, phenotypes)
-        if not diseases:
-            continue  # no disease info = no Phenopacket needed
-
-        rel_subject = {
-            "id": id_map[p.id],
-            "sex": SEX_CODE_TO_PHENOPACKET.get(p.sex, "UNKNOWN_SEX"),
-        }
-        if p.deceased:
-            rel_subject["vitalStatus"] = {"status": "DECEASED"}
-
-        rel_packet = {"id": f"{family.family_id}-{id_map[p.id]}", "subject": rel_subject}
-        rel_packet[conditions_field] = [make_condition(d) for d in diseases]
-        relatives.append(rel_packet)
-
-    # Build metadata
-    meta_data = {
-        "created": date.today().isoformat() + "T00:00:00Z",
-        "createdBy": "studio2ga4gh",
-        "resources": [],
-    }
-
-    # Assemble Family
-    family_doc = {
-        "id": family.family_id,
-        "pedigree": pedigree_block,
-        "metaData": meta_data,
-    }
-    if proband_phenopacket:
-        family_doc["proband"] = proband_phenopacket
-    if relatives:
-        family_doc["relatives"] = relatives
-    if consanguinous:
-        family_doc["consanguinousParents"] = True
-
-    return family_doc
-
-
-# ── Public API ────────────────────────────────────────────────────────────
 
 @dataclass
 class ConversionResult:
-    files: list  # [(filename, content_string)]
-    families: list
-    phenotypes: list
-    summary: str
+    files: List[Tuple[str, str]]               # (file name, JSON text)
+    kindreds: List[Kindred]
+    conditions: List[str]                      # condition names in the colour key
+    unmatched: List[str]                       # conditions with no ontology term yet
+    warnings: List[str]
+    notes: List[str] = field(default_factory=list)
+    summary: str = ""
+
+    @property
+    def families(self) -> List[Kindred]:       # the name used by version 0.3
+        return self.kindreds
 
 
-def convert(session_data: dict, output_prefix: str = "pedigree",
-            use_phenotypic_features: bool = False,
-            include_names: bool = False) -> ConversionResult:
-    """Convert a Pedigree Studio session to GA4GH Pedigree and Phenopackets files.
+def load_terms(obj) -> Dict[str, Dict[str, str]]:
+    """Normalise a condition -> term mapping.
 
-    Parameters
-    ----------
-    use_phenotypic_features : bool
-        If True, conditions are recorded as phenotypicFeatures (HPO-style).
-    include_names : bool
-        If True, names and dates of birth from annotation text are included.
-        Default is False (anonymous output).
+    Accepts ``{"Breast cancer": "MONDO:0007254"}``, ``{"Breast cancer": {"id": ...,
+    "label": ..., "kind": ...}}`` and decision logs from hponorm, mondonorm or
+    phenotk (``{"resolved": {...}}``). Labels are matched without regard to case.
     """
-    persons, partnerships, child_links, twin_links, legend_labels = parse_session(session_data)
-    if not persons:
-        return ConversionResult(files=[], families=[], phenotypes=[], summary="No persons found.")
-
-    families = detect_families(persons, partnerships, child_links, twin_links)
-    for fam in families:
-        resolve_parents(fam)
-
-    phenotypes = extract_phenotypes(legend_labels)
-
-    files = []
-    for i, fam in enumerate(families):
-        suffix = f"_{i + 1}" if len(families) > 1 else ""
-
-        if include_names:
-            id_map = {p.id: make_individual_id(p) for p in fam.persons.values()}
-        else:
-            counter = 0
-            id_map = {}
-            for p in sorted(fam.persons.values(), key=lambda x: x.id):
-                counter += 1
-                id_map[p.id] = f"ind-{counter}"
-
-        ga4gh = build_ga4gh_pedigree(fam, phenotypes, id_map, include_names)
-        ga4gh_json = json.dumps(ga4gh, indent=2)
-        files.append((f"{output_prefix}{suffix}_ga4gh.json", ga4gh_json))
-
-        phenopackets = build_phenopackets_family(fam, phenotypes, id_map, use_phenotypic_features)
-        phenopackets_json = json.dumps(phenopackets, indent=2)
-        files.append((f"{output_prefix}{suffix}_phenopackets.json", phenopackets_json))
-
-    fam_desc = ", ".join(f"{f.family_id} ({len(f.persons)} individuals)" for f in families)
-    pheno_desc = ", ".join(ph.name for ph in phenotypes) if phenotypes else "none"
-    condition_type = "phenotypic features" if use_phenotypic_features else "diseases"
-    twins = sum(len(f.twin_links) for f in families)
-    adopted = sum(1 for f in families for p in f.persons.values() if p.is_adopted)
-    anon = "anonymous" if not include_names else "with names"
-    summary = (
-        f"Converted {len(families)} pedigree(s): {fam_desc}. "
-        f"Conditions ({condition_type}): {pheno_desc}. "
-        f"Twins: {twins}. Adoptions: {adopted}. Output: {anon}. "
-        f"Files: {len(files)} ({len(families)} GA4GH + {len(families)} Phenopackets)."
-    )
-
-    return ConversionResult(files=files, families=families, phenotypes=phenotypes, summary=summary)
+    if isinstance(obj, dict) and isinstance(obj.get("resolved"), dict):
+        obj = obj["resolved"]
+    out: Dict[str, Dict[str, str]] = {}
+    for label, val in (obj or {}).items():
+        if isinstance(val, str):
+            out[label.strip().lower()] = {"id": val.strip(), "label": label.strip()}
+        elif isinstance(val, dict) and (val.get("id") or val.get("curie")):
+            out[label.strip().lower()] = {"id": (val.get("id") or val.get("curie")).strip(),
+                                          "label": (val.get("label") or label).strip(),
+                                          "kind": val.get("kind", ""),
+                                          "version": val.get("version", "")}
+    return out
 
 
-def convert_file(input_path: str, output_prefix: Optional[str] = None,
-                 output_dir: Optional[str] = None,
-                 use_phenotypic_features: bool = False,
-                 include_names: bool = False) -> ConversionResult:
-    """Read a session JSON and write GA4GH + Phenopackets files."""
-    with open(input_path, "r") as f:
-        session_data = json.load(f)
+_KEY_CURIE = re.compile(r"^(.*?)\s*[\[(]\s*([A-Za-z][A-Za-z0-9.\-]*:[^\s\])]+)\s*[\])]\s*$")
 
+
+def split_key_label(text: str) -> Tuple[str, Optional[str]]:
+    """Split a colour-key entry such as ``"Breast cancer [MONDO:0007254]"`` into
+    its name and ontology id. Without an id in brackets the id is ``None``."""
+    m = _KEY_CURIE.match(text or "")
+    if m and ontology.is_curie(ontology.tidy_curie(m.group(2))):
+        return m.group(1).strip() or m.group(2), ontology.tidy_curie(m.group(2))
+    return (text or "").strip(), None
+
+
+def _components(s: Session) -> List[List[str]]:
+    """Separate families on the canvas: people joined by lines, markers left out."""
+    adj: Dict[str, set] = defaultdict(set)
+    people = [pid for pid, p in s.persons.items() if not p.is_marker]
+    for pr in s.partnerships.values():
+        adj[pr.a].add(pr.b)
+        adj[pr.b].add(pr.a)
+    for cl in s.child_links:
+        pr = s.partnerships[cl.partnership]
+        for parent in (pr.a, pr.b):
+            adj[cl.child].add(parent)
+            adj[parent].add(cl.child)
+    for t in s.twin_links:
+        adj[t.a].add(t.b)
+        adj[t.b].add(t.a)
+    seen, comps = set(), []
+    order = sorted(people, key=lambda pid: (s.persons[pid].y, s.persons[pid].x))
+    for start in order:
+        if start in seen:
+            continue
+        comp, stack = [], [start]
+        while stack:
+            cur = stack.pop()
+            if cur in seen or s.persons[cur].is_marker:
+                continue
+            seen.add(cur)
+            comp.append(cur)
+            stack.extend(adj[cur] - seen)
+        comps.append(sorted(comp, key=lambda pid: (s.persons[pid].y, s.persons[pid].x)))
+    return comps
+
+
+def _parent_relation(parent: StudioPerson, dashed: bool, warnings: List[str], ids: Dict[str, str]) -> str:
+    if dashed:
+        return kin.ADOPTIVE_PARENT
+    if parent.centre == "S":
+        return kin.GESTATIONAL_CARRIER
+    if parent.centre == "D":
+        if parent.sex == "MALE":
+            return kin.SPERM_DONOR
+        if parent.sex == "FEMALE":
+            return kin.OVUM_DONOR
+        warnings.append("{} is marked as a donor but their sex is not known; recorded as a biological "
+                        "parent".format(ids[parent.id]))
+        return kin.BIOLOGICAL_PARENT
+    if parent.sex == "MALE":
+        return kin.BIOLOGICAL_FATHER
+    if parent.sex == "FEMALE":
+        return kin.BIOLOGICAL_MOTHER
+    return kin.BIOLOGICAL_PARENT
+
+
+def session_to_kindreds(session_data: dict, *, terms: Optional[dict] = None, kind: str = DISEASE,
+                        ids: str = "numbers", family_id: str = "FAM") -> Tuple[List[Kindred], List[str], List[str], List[str]]:
+    """Read a Pedigree Studio session into one Kindred per family on the canvas.
+
+    ``terms`` maps condition names in the colour key to ontology terms (see
+    :func:`load_terms`); ``kind`` says whether unmatched conditions count as
+    diseases or phenotypes; ``ids`` is ``"numbers"`` (pedigree numbers such as
+    II-3, the default), ``"drawing"`` (the labels shown in the drawing, which
+    may be names) or ``"studio"`` (Pedigree Studio's internal ids).
+
+    Returns ``(kindreds, conditions, warnings, notes)``.
+    """
+    s = parse(session_data)
+    mapping = load_terms(terms or {})
+    warnings: List[str] = []
+    notes_all: List[str] = []
+    if ids == "drawing":
+        labels = s.drawing_labels()
+    elif ids == "studio":
+        labels = {pid: pid for pid in s.persons}
+    else:
+        labels = s.numbers()
+    # ids must be unique; fall back to pedigree numbers for any clash
+    counts: Dict[str, int] = defaultdict(int)
+    for pid, p in s.persons.items():
+        if not p.is_marker:
+            counts[labels[pid]] += 1
+    nums = s.numbers()
+    idmap = {}
+    for pid in s.persons:
+        lab = re.sub(r"\s+", "_", (labels.get(pid) or "").strip()) or nums[pid]
+        if counts[labels.get(pid)] > 1:
+            lab = nums[pid]
+        idmap[pid] = lab
+    conditions = [v.strip() for v in s.legend.values() if (v or "").strip()]
+    conditions = list(dict.fromkeys(conditions))
+    comps = _components(s)
+    kids_of = s.couple_children()
+    kindreds: List[Kindred] = []
+    for n, comp in enumerate(comps, 1):
+        fam_id = "{}{}".format(family_id, n) if len(comps) > 1 or family_id == "FAM" else family_id
+        k = Kindred(id=fam_id, date=date.today().isoformat())
+        notes: List[str] = []
+        in_comp = set(comp)
+        for pid in comp:
+            p = s.persons[pid]
+            m = Member(id=idmap[pid], sex=p.sex, index=p.proband)
+            if p.is_loss:
+                m.vital_status = "DECEASED"
+                notes.append("{} is a pregnancy loss".format(m.id))
+            elif p.centre == "P":
+                m.vital_status = None
+                notes.append("{} is a pregnancy".format(m.id))
+            else:
+                m.vital_status = "DECEASED" if p.deceased else "ALIVE"
+            if p.centre == "dot":
+                notes.append("{} is a carrier".format(m.id))
+            elif p.centre == "line":
+                notes.append("{} is a presymptomatic carrier".format(m.id))
+            elif re.fullmatch(r"\d+|n", p.centre or "", flags=re.I):
+                warnings.append("{} stands for {} people in the drawing but is exported as one person".format(
+                    m.id, p.centre))
+            names = s.condition_names(p)
+            for name in names:
+                hit = mapping.get(name.lower())
+                if not hit:
+                    base, curie = split_key_label(name)
+                    hit = mapping.get(base.lower())
+                    if not hit and curie:
+                        hit = {"id": curie, "label": base}
+                if hit:
+                    tk = hit.get("kind") or (PHENOTYPE if ontology.prefix_of(hit["id"]) == "HP" else DISEASE)
+                    m.terms.append(Term(label=hit.get("label") or name, id=ontology.tidy_curie(hit["id"]), kind=tk))
+                    if hit.get("version"):
+                        k.versions.setdefault(ontology.prefix_of(ontology.tidy_curie(hit["id"])), hit["version"])
+                else:
+                    m.terms.append(Term(label=split_key_label(name)[0], kind=kind))
+            unnamed = s.unnamed_colours(p)
+            if unnamed:
+                warnings.append("{} is shaded in {}, which the colour key does not name".format(
+                    m.id, ", ".join(unnamed)))
+            m.affected = True if p.filled else False
+            k.members.append(m)
+        # parents and children
+        for pr in s.partnerships.values():
+            if pr.a not in in_comp and pr.b not in in_comp:
+                continue
+            links = kids_of.get(pr.id, [])
+            real = [cl for cl in links if not s.persons[cl.child].is_marker]
+            markers = [cl for cl in links if s.persons[cl.child].is_marker]
+            a, b = s.persons[pr.a], s.persons[pr.b]
+            for cl in markers:
+                notes.append("{} and {}: {}".format(idmap[pr.a], idmap[pr.b], dict(
+                    [("no-offspring", "no children"), ("infertile", "infertility")])[s.persons[cl.child].shape]))
+            for cl in real:
+                for parent in (a, b):
+                    if parent.is_marker or parent.is_loss:
+                        continue
+                    rel = _parent_relation(parent, cl.dashed, warnings, idmap)
+                    k.relations.append(Relation(idmap[parent.id], rel, idmap[cl.child]))
+            if pr.consanguineous:
+                code = kin.SEPARATED_CONSANGUINEOUS_PARTNER if pr.separated else kin.CONSANGUINEOUS_PARTNER
+            elif pr.separated:
+                code = kin.SEPARATED_PARTNER
+            elif not real:
+                code = kin.PARTNER
+            else:
+                code = None          # implied by their shared children
+            if code:
+                k.relations.append(Relation(idmap[pr.a], code, idmap[pr.b]))
+        # twins: all relative to the same (leftmost) twin, as the reduced form asks
+        root: Dict[str, str] = {}
+
+        def find(x):
+            while root.get(x, x) != x:
+                x = root[x]
+            return x
+        comp_twins = [t for t in s.twin_links if t.a in in_comp and t.b in in_comp]
+        for t in comp_twins:
+            root.setdefault(t.a, t.a)
+            root.setdefault(t.b, t.b)
+            root[find(t.a)] = find(t.b)
+        sets: Dict[str, List[str]] = defaultdict(list)
+        for x in root:
+            sets[find(x)].append(x)
+        for group in sets.values():
+            group.sort(key=lambda pid: s.persons[pid].x)
+            first = group[0]
+            links = [t for t in comp_twins if t.a in group]
+            for other in group[1:]:
+                direct = [t for t in links if {t.a, t.b} == {first, other}]
+                # twins joined only through a third count as identical only if every link is
+                identical = direct[0].identical if direct else all(t.identical for t in links)
+                code = kin.MONOZYGOTIC_MULTIPLE_BIRTH_SIBLING if identical else kin.POLYZYGOTIC_MULTIPLE_BIRTH_SIBLING
+                k.relations.append(Relation(idmap[first], code, idmap[other]))
+        index = [m.id for m in k.members if m.index]
+        conds = sorted({t.label for m in k.members for t in m.terms})
+        parts = ["Pedigree drawn in Pedigree Studio: {} people{}.".format(
+            len(k.members), "; proband {}".format(", ".join(index)) if index else "")]
+        if conds:
+            parts.append("Conditions: {}.".format(", ".join(conds)))
+        if notes:
+            parts.append(" ".join(n[0].upper() + n[1:] + "." for n in notes))
+        k.narrative = " ".join(parts)
+        notes_all.extend(notes)
+        kindreds.append(k)
+    return kindreds, conditions, warnings, notes_all
+
+
+def convert(session_data: dict, output_prefix: str = "pedigree", *, terms: Optional[dict] = None,
+            use_phenotypic_features: bool = False, ids: str = "numbers", created_by: str = CREATED_BY,
+            created: Optional[str] = None, family_id: str = "FAM", outputs=("pedigree", "family"),
+            include_names: Optional[bool] = None) -> ConversionResult:
+    """Convert a Pedigree Studio session to GA4GH files.
+
+    Writes ``<prefix>_ga4gh-pedigree.json`` (GA4GH Pedigree) and
+    ``<prefix>_phenopackets-family.json`` (Phenopackets Family) for each family
+    in the drawing (``_2``, ``_3`` ... are added when there are several).
+
+    ``include_names`` is kept for compatibility with version 0.3: ``True`` is
+    the same as ``ids="drawing"``. Names are never written into the files.
+    """
+    if include_names:
+        ids = "drawing"
+    kind = PHENOTYPE if use_phenotypic_features else DISEASE
+    kindreds, conditions, warnings, notes = session_to_kindreds(
+        session_data, terms=terms, kind=kind, ids=ids, family_id=family_id)
+    files: List[Tuple[str, str]] = []
+    for i, k in enumerate(kindreds):
+        suffix = "_{}".format(i + 1) if len(kindreds) > 1 else ""
+        if "pedigree" in outputs:
+            doc, w = to_ga4gh_pedigree(k, created_by=created_by, created=created)
+            warnings.extend(w)
+            files.append(("{}{}_ga4gh-pedigree.json".format(output_prefix, suffix), dumps(doc)))
+        if "family" in outputs:
+            doc, w = to_phenopackets_family(k, created_by=created_by, created=created)
+            warnings.extend(w)
+            files.append(("{}{}_phenopackets-family.json".format(output_prefix, suffix), dumps(doc)))
+    matched = load_terms(terms or {})
+    unmatched = [c for c in conditions if c.lower() not in matched
+                 and split_key_label(c)[0].lower() not in matched and split_key_label(c)[1] is None]
+    warnings = list(dict.fromkeys(warnings))
+    people = sum(len(k.members) for k in kindreds)
+    summary = "{} famil{} ({} people). Conditions: {}.".format(
+        len(kindreds), "y" if len(kindreds) == 1 else "ies", people,
+        ", ".join(conditions) if conditions else "none")
+    if unmatched:
+        summary += " Not yet matched to an ontology term, so left out: {}.".format(", ".join(unmatched))
+    return ConversionResult(files=files, kindreds=kindreds, conditions=conditions, unmatched=unmatched,
+                            warnings=warnings, notes=notes, summary=summary)
+
+
+def convert_file(input_path: str, output_prefix: Optional[str] = None, output_dir: Optional[str] = None,
+                 **options) -> ConversionResult:
+    """Read a session file and write the GA4GH files next to it (or into ``output_dir``)."""
+    with open(input_path, "r", encoding="utf-8-sig") as fh:
+        data = json.load(fh)
     if output_prefix is None:
-        output_prefix = os.path.splitext(os.path.basename(input_path))[0]
+        base = os.path.basename(input_path)
+        for ext in (".studio.json", ".json"):
+            if base.endswith(ext):
+                base = base[: -len(ext)]
+                break
+        output_prefix = base
     if output_dir is None:
         output_dir = os.path.dirname(input_path) or "."
-
-    result = convert(session_data, output_prefix, use_phenotypic_features, include_names)
-
+    result = convert(data, output_prefix, **options)
     written = []
-    for filename, content in result.files:
-        filepath = os.path.join(output_dir, filename)
-        with open(filepath, "w") as f:
-            f.write(content)
-        written.append((filepath, content))
-
+    for name, text in result.files:
+        path = os.path.join(output_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        written.append((path, text))
     result.files = written
     return result
