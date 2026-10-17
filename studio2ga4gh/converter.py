@@ -312,7 +312,7 @@ def get_person_diseases(person, phenotypes):
 
 # ── GA4GH Pedigree output ────────────────────────────────────────────────
 
-def build_ga4gh_pedigree(family, phenotypes, id_map):
+def build_ga4gh_pedigree(family, phenotypes, id_map, include_names=False):
     """Build a GA4GH Pedigree Standard JSON document."""
     pship_map = {p.id: p for p in family.partnerships}
 
@@ -323,11 +323,10 @@ def build_ga4gh_pedigree(family, phenotypes, id_map):
             "id": id_map[p.id],
             "sex": SEX_CODE_TO_GA4GH.get(p.sex, "UNKNOWN_SEX"),
         }
-        # Name from annotation text
-        if p.text and p.text.strip():
+        # Name and DOB from annotation text — only if include_names is True
+        if include_names and p.text and p.text.strip():
             parts = p.text.strip().split("\n")
             ind["name"] = parts[0].strip()
-            # Date of birth from "b. YYYY" pattern
             for part in parts:
                 dob_match = re.search(r"b\.\s*(\d{4})", part)
                 if dob_match:
@@ -419,7 +418,6 @@ def _make_disease_term(label: str) -> dict:
     """Create a Phenopackets Disease element from a free-text label.
 
     The OntologyClass `term` uses the label as-is with an empty `id` field.
-    This follows the pattern used in the GA4GH Pedigree Standard examples.
     For full Phenopackets compliance, downstream tools should map these labels
     to ontology terms (OMIM, Orphanet, MONDO, etc.).
     """
@@ -428,14 +426,40 @@ def _make_disease_term(label: str) -> dict:
     }
 
 
-def build_phenopackets_family(family, phenotypes, id_map):
+def _make_phenotypic_feature(label: str) -> dict:
+    """Create a Phenopackets PhenotypicFeature element from a free-text label.
+
+    The OntologyClass `type` uses the label as-is with an empty `id` field.
+    For full Phenopackets compliance, downstream tools should map these labels
+    to HPO terms (e.g. HP:0000520).
+    """
+    return {
+        "type": {"id": "", "label": label},
+    }
+
+
+def build_phenopackets_family(family, phenotypes, id_map, use_phenotypic_features=False):
     """Build a Phenopackets Family JSON document.
 
     Contains:
     - A PED-compatible Pedigree (list of Person records)
-    - Disease information extracted from the legend
+    - Disease or phenotypic feature information extracted from the legend
     - Proband Phenopacket
+
+    Parameters
+    ----------
+    use_phenotypic_features : bool
+        If True, conditions are recorded as phenotypicFeatures (HPO-style)
+        instead of diseases (OMIM/MONDO-style).
     """
+    # Helper to create the right element type
+    def make_condition(label):
+        if use_phenotypic_features:
+            return _make_phenotypic_feature(label)
+        return _make_disease_term(label)
+
+    # Field name in the Phenopacket
+    conditions_field = "phenotypicFeatures" if use_phenotypic_features else "diseases"
     # Build PED-compatible pedigree
     ped_persons = []
     for p in sorted(family.persons.values(), key=lambda x: x.id):
@@ -486,14 +510,14 @@ def build_phenopackets_family(family, phenotypes, id_map):
         if proband_person.deceased:
             proband_subject["vitalStatus"] = {"status": "DECEASED"}
 
-        proband_diseases = [_make_disease_term(d) for d in get_person_diseases(proband_person, phenotypes)]
+        proband_conditions = [make_condition(d) for d in get_person_diseases(proband_person, phenotypes)]
 
         proband_phenopacket = {
             "id": f"{family.family_id}-proband",
             "subject": proband_subject,
         }
-        if proband_diseases:
-            proband_phenopacket["diseases"] = proband_diseases
+        if proband_conditions:
+            proband_phenopacket[conditions_field] = proband_conditions
 
     # Build relative phenopackets — ONLY for affected relatives with disease info.
     # Unaffected relatives and deceased-but-unaffected individuals do not need
@@ -514,7 +538,7 @@ def build_phenopackets_family(family, phenotypes, id_map):
             rel_subject["vitalStatus"] = {"status": "DECEASED"}
 
         rel_packet = {"id": f"{family.family_id}-{id_map[p.id]}", "subject": rel_subject}
-        rel_packet["diseases"] = [_make_disease_term(d) for d in diseases]
+        rel_packet[conditions_field] = [make_condition(d) for d in diseases]
         relatives.append(rel_packet)
 
     # Build metadata
@@ -550,14 +574,18 @@ class ConversionResult:
     summary: str
 
 
-def convert(session_data: dict, output_prefix: str = "pedigree") -> ConversionResult:
+def convert(session_data: dict, output_prefix: str = "pedigree",
+            use_phenotypic_features: bool = False,
+            include_names: bool = False) -> ConversionResult:
     """Convert a Pedigree Studio session to GA4GH Pedigree and Phenopackets files.
 
-    Produces two JSON files per family:
-    - {prefix}_ga4gh.json — GA4GH Pedigree Standard (relationship graph with KIN codes)
-    - {prefix}_phenopackets.json — Phenopackets Family (PED-compatible pedigree + diseases)
-
-    For sessions with multiple disconnected pedigrees, produces numbered pairs.
+    Parameters
+    ----------
+    use_phenotypic_features : bool
+        If True, conditions are recorded as phenotypicFeatures (HPO-style).
+    include_names : bool
+        If True, names and dates of birth from annotation text are included.
+        Default is False (anonymous output).
     """
     persons, partnerships, child_links, twin_links, legend_labels = parse_session(session_data)
     if not persons:
@@ -572,26 +600,34 @@ def convert(session_data: dict, output_prefix: str = "pedigree") -> ConversionRe
     files = []
     for i, fam in enumerate(families):
         suffix = f"_{i + 1}" if len(families) > 1 else ""
-        id_map = {p.id: make_individual_id(p) for p in fam.persons.values()}
 
-        # GA4GH Pedigree
-        ga4gh = build_ga4gh_pedigree(fam, phenotypes, id_map)
+        if include_names:
+            id_map = {p.id: make_individual_id(p) for p in fam.persons.values()}
+        else:
+            counter = 0
+            id_map = {}
+            for p in sorted(fam.persons.values(), key=lambda x: x.id):
+                counter += 1
+                id_map[p.id] = f"ind-{counter}"
+
+        ga4gh = build_ga4gh_pedigree(fam, phenotypes, id_map, include_names)
         ga4gh_json = json.dumps(ga4gh, indent=2)
         files.append((f"{output_prefix}{suffix}_ga4gh.json", ga4gh_json))
 
-        # Phenopackets Family
-        phenopackets = build_phenopackets_family(fam, phenotypes, id_map)
+        phenopackets = build_phenopackets_family(fam, phenotypes, id_map, use_phenotypic_features)
         phenopackets_json = json.dumps(phenopackets, indent=2)
         files.append((f"{output_prefix}{suffix}_phenopackets.json", phenopackets_json))
 
     fam_desc = ", ".join(f"{f.family_id} ({len(f.persons)} individuals)" for f in families)
     pheno_desc = ", ".join(ph.name for ph in phenotypes) if phenotypes else "none"
+    condition_type = "phenotypic features" if use_phenotypic_features else "diseases"
     twins = sum(len(f.twin_links) for f in families)
     adopted = sum(1 for f in families for p in f.persons.values() if p.is_adopted)
+    anon = "anonymous" if not include_names else "with names"
     summary = (
         f"Converted {len(families)} pedigree(s): {fam_desc}. "
-        f"Phenotypes: {pheno_desc}. "
-        f"Twins: {twins}. Adoptions: {adopted}. "
+        f"Conditions ({condition_type}): {pheno_desc}. "
+        f"Twins: {twins}. Adoptions: {adopted}. Output: {anon}. "
         f"Files: {len(files)} ({len(families)} GA4GH + {len(families)} Phenopackets)."
     )
 
@@ -599,7 +635,9 @@ def convert(session_data: dict, output_prefix: str = "pedigree") -> ConversionRe
 
 
 def convert_file(input_path: str, output_prefix: Optional[str] = None,
-                 output_dir: Optional[str] = None) -> ConversionResult:
+                 output_dir: Optional[str] = None,
+                 use_phenotypic_features: bool = False,
+                 include_names: bool = False) -> ConversionResult:
     """Read a session JSON and write GA4GH + Phenopackets files."""
     with open(input_path, "r") as f:
         session_data = json.load(f)
@@ -609,7 +647,7 @@ def convert_file(input_path: str, output_prefix: Optional[str] = None,
     if output_dir is None:
         output_dir = os.path.dirname(input_path) or "."
 
-    result = convert(session_data, output_prefix)
+    result = convert(session_data, output_prefix, use_phenotypic_features, include_names)
 
     written = []
     for filename, content in result.files:

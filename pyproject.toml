@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "studio2ga4gh"
-version = "0.1.0"
+version = "0.3.0"
 description = "Convert Pedigree Studio sessions to GA4GH Pedigree Standard and Phenopackets"
 readme = "README.md"
 license = {text = "MIT"}

@@ -11,9 +11,16 @@ def main(argv=None):
         help="Base name for output files (default: input filename stem)")
     parser.add_argument("-d", "--output-dir", default=None, dest="output_dir",
         help="Directory for output files (default: same as input)")
+    parser.add_argument("--phenotypes", action="store_true",
+        help="Record conditions as phenotypicFeatures (HPO-style) instead of diseases in Phenopackets output")
+    parser.add_argument("--include-names", action="store_true", dest="include_names",
+        help="Include names and dates of birth in the output (default: anonymous)")
     args = parser.parse_args(argv)
     try:
-        result = convert_file(args.input, output_prefix=args.output_prefix, output_dir=args.output_dir)
+        result = convert_file(args.input, output_prefix=args.output_prefix,
+                             output_dir=args.output_dir,
+                             use_phenotypic_features=args.phenotypes,
+                             include_names=args.include_names)
         print(result.summary)
         for filepath, _ in result.files:
             print(f"  Written: {filepath}")
