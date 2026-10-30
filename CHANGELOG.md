@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.1
+
+For the symbols of the 2025 correction to the pedigree nomenclature
+(Steinhaus French, Bennett and Resta, *J Genet Couns* 2025;34(2):e2020),
+which Pedigree Studio now draws:
+
+- G in a parent's symbol is a gestational carrier (`isGestationalCarrierOf`),
+  not a biological parent, as S has been. S, which older drawings use, still
+  means the same.
+- Twins of unknown zygosity (the Studio's "Not known (?)") are
+  `isMultipleBirthSiblingOf`, which says nothing about zygosity. 0.4.0 wrote
+  every twin that was not identical as `isPolyzygoticMultipleBirthSiblingOf`,
+  so it would have called them non-identical.
+- Twins joined only through a third get the zygosity that the chain of twin
+  lines between them gives: an identical twin shares the other's relation,
+  a line of unknown zygosity leaves it unknown, and non-identical twins of a
+  non-identical twin stay non-identical. 0.4.0 called them identical only if
+  every line in the set was identical, so identical twins joined through a
+  third could come out non-identical when another twin in the set was not.
+- A consultand (an arrow without a P) is noted in the narrative, as carriers
+  and pregnancies are: the GA4GH files have no place of their own for one.
+
 ## 0.4.0
 
 studio2ga4gh now writes its files through

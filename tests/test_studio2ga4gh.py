@@ -88,7 +88,7 @@ def test_features_drawing():
     assert errors(ped) == [] and errors(fam) == []
     got = rels(ped)
     labels = Counter(lab for _, lab, _ in got)
-    # surrogate and donor marks
+    # gestational carrier (S, in this older drawing) and donor marks
     assert labels["isGestationalCarrierOf"] == 1 and labels["isSpermDonorOf"] == 1
     # dashed line and the adopted symbol
     assert labels["isAdoptiveParentOf"] == 2
@@ -120,6 +120,75 @@ def test_features_drawing():
     assert persons[carried]["maternalId"] != carrier
     assert any("stands for 3 people" in w for w in r.warnings)
     assert any("does not name" in w for w in r.warnings)
+
+
+def _features_with(change):
+    data = session("features")
+    change(data)
+    r = studio2ga4gh.convert(data, "features", created=CREATED)
+    ped = loads(r.files[0][1])
+    assert errors(ped) == [] and errors(loads(r.files[1][1])) == []
+    return r, ped
+
+
+def test_g_marks_a_gestational_carrier():
+    """Since the 2025 correction to the nomenclature, the Studio marks a gestational carrier G; S, in older
+    drawings, means the same, and both give the same files."""
+    def to_g(data):
+        [p for p in data["persons"] if p.get("centerText") == "S"][0]["centerText"] = "G"
+    r, ped = _features_with(to_g)
+    got = rels(ped)
+    assert Counter(lab for _, lab, _ in got)["isGestationalCarrierOf"] == 1
+    assert got == rels(loads(studio2ga4gh.convert(session("features"), "features", created=CREATED).files[0][1]))
+    fam = loads(r.files[1][1])
+    persons = {p["individualId"]: p for p in fam["pedigree"]["persons"]}
+    carrier, _, carried = [t for t in got if t[1] == "isGestationalCarrierOf"][0]
+    assert persons[carried]["maternalId"] != carrier
+
+
+def _twins(ped):
+    return {(a, b): lab for a, lab, b in rels(ped) if "MultipleBirth" in lab}
+
+
+def _set_twins(kinds):
+    def change(data):
+        for t, kind in zip(data["twinLinks"], kinds):
+            t["type"] = kind
+    return change
+
+
+def test_twins_of_unknown_zygosity():
+    """The Studio's "Not known (?)" twins are isMultipleBirthSiblingOf, which says nothing of zygosity. Twins
+    joined only through a third get the zygosity that the chain of twin lines gives."""
+    # the features triplets: c2-c3 and c3-c4 are joined, c2 is the leftmost
+    _, ped = _features_with(_set_twins(["identical", "unknown"]))
+    pairs = _twins(ped)
+    assert len(pairs) == 2 and len({a for a, _ in pairs}) == 1
+    first = next(iter(pairs))[0]
+    labels = sorted(pairs.values())
+    assert labels == ["isMonozygoticMultipleBirthSiblingOf", "isMultipleBirthSiblingOf"]   # c3; c4 through c3
+    _, ped = _features_with(_set_twins(["unknown", "unknown"]))
+    assert set(_twins(ped).values()) == {"isMultipleBirthSiblingOf"}
+    _, ped = _features_with(_set_twins(["unknown", "nonidentical"]))
+    assert set(_twins(ped).values()) == {"isMultipleBirthSiblingOf"}
+    # a set drawn as non-identical twins stays non-identical, as before
+    _, ped = _features_with(_set_twins(["nonidentical", "nonidentical"]))
+    assert set(_twins(ped).values()) == {"isPolyzygoticMultipleBirthSiblingOf"}
+    # identical twins of each other are identical, however they are joined
+    _, ped = _features_with(_set_twins(["identical", "identical"]))
+    assert set(_twins(ped).values()) == {"isMonozygoticMultipleBirthSiblingOf"}
+    assert first
+
+
+def test_a_consultand_is_noted_in_the_narrative():
+    """The consultand (an arrow without a P) has no place of its own in the GA4GH files: the narrative says who."""
+    def mark(data):
+        [p for p in data["persons"] if p["id"] == "gm"][0]["consultand"] = True
+    r, ped = _features_with(mark)
+    assert " is a consultand." in ped["narrative"]
+    assert sum(" is a consultand" in n for n in r.notes) == 1
+    plain = loads(studio2ga4gh.convert(session("features"), "features", created=CREATED).files[0][1])
+    assert "consultand" not in plain["narrative"]
 
 
 def test_notes_keep_ids_as_they_are():

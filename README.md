@@ -86,13 +86,15 @@ conditions to terms* will find the terms.
 |---|---|
 | square, circle, diamond | sex `MALE`, `FEMALE`, `UNKNOWN_SEX` |
 | slash (deceased) | vital status `DECEASED` (otherwise `ALIVE`) |
-| arrow (proband) | `indexPatients`, and the Family's proband |
+| arrow with a P (proband) | `indexPatients`, and the Family's proband |
+| arrow alone (consultand) | noted in the narrative |
 | fill, halves, quarters, shading | a disease or phenotypic feature for each condition named in the colour key |
 | child line from a couple | `isBiologicalMotherOf`, `isBiologicalFatherOf` (`isBiologicalParentOf` when the parent's sex is unknown) |
 | dashed child line | `isAdoptiveParentOf` |
 | D in a parent's symbol | `isSpermDonorOf` or `isOvumDonorOf` |
-| S in a parent's symbol | `isGestationalCarrierOf` (not a biological parent) |
+| G in a parent's symbol (S in drawings from before the 2025 correction to the nomenclature) | `isGestationalCarrierOf` (not a biological parent) |
 | identical or non-identical twins | `isMonozygoticMultipleBirthSiblingOf`, `isPolyzygoticMultipleBirthSiblingOf` |
+| twins of unknown zygosity (?) | `isMultipleBirthSiblingOf` |
 | consanguineous couple | `isConsanguineousPartnerOf` |
 | separated couple | `isSeparatedPartnerOf` |
 | couple without children | `isPartnerOf` |
@@ -102,7 +104,11 @@ conditions to terms* will find the terms.
 
 Relationships are written in the standard's reduced form: parents to their
 children, partners only when their children don't already say so, twins all
-relative to one twin, and no siblings, since shared parents imply them.
+relative to one twin, and no siblings, since shared parents imply them. Two
+twins with no twin line between them get the zygosity the chain of lines that
+joins them gives: an identical twin shares the other's relation, a line of
+unknown zygosity leaves it unknown, and the non-identical twin of a
+non-identical twin is non-identical.
 
 Names and other notes written under the symbols are never exported:
 Phenopackets have no field for a name, and such notes are often personal data.
