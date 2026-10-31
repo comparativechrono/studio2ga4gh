@@ -146,6 +146,20 @@ def test_g_marks_a_gestational_carrier():
     assert persons[carried]["maternalId"] != carrier
 
 
+def test_a_symbol_in_thirds_has_each_condition():
+    """Pedigree Studio can divide a symbol into thirds, one part for each of up to three conditions (Bennett et al.
+    2022): each colour in it is a condition the person has, as with halves and quarters."""
+    one = parse({"persons": [{"id": "a", "shape": "female", "x": 0, "y": 0, "fillMode": "thirds",
+                              "thirds": ["#c0392b", None, "#2980b9"]}]}).persons["a"]
+    assert one.colours() == ["#c0392b", "#2980b9"] and one.filled
+
+    def to_thirds(data):
+        p = [q for q in data["persons"] if q["id"] == "p6"][0]   # in halves, one for each condition
+        p["fillMode"], p["thirds"], p["halves"] = "thirds", ["#c0392b", None, "#2980b9"], [None, None]
+    r, _ = _features_with(to_thirds)
+    assert r.files == studio2ga4gh.convert(session("features"), "features", created=CREATED).files
+
+
 def _twins(ped):
     return {(a, b): lab for a, lab, b in rels(ped) if "MultipleBirth" in lab}
 

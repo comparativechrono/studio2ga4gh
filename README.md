@@ -88,7 +88,7 @@ conditions to terms* will find the terms.
 | slash (deceased) | vital status `DECEASED` (otherwise `ALIVE`) |
 | arrow with a P (proband) | `indexPatients`, and the Family's proband |
 | arrow alone (consultand) | noted in the narrative |
-| fill, halves, quarters, shading | a disease or phenotypic feature for each condition named in the colour key |
+| fill, halves, thirds, quarters, shading | a disease or phenotypic feature for each condition named in the colour key |
 | child line from a couple | `isBiologicalMotherOf`, `isBiologicalFatherOf` (`isBiologicalParentOf` when the parent's sex is unknown) |
 | dashed child line | `isAdoptiveParentOf` |
 | D in a parent's symbol | `isSpermDonorOf` or `isOvumDonorOf` |
