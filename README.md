@@ -99,7 +99,7 @@ conditions to terms* will find the terms.
 | separated couple | `isSeparatedPartnerOf` |
 | couple without children | `isPartnerOf` |
 | pregnancy loss (triangle) | a person with vital status `DECEASED`, noted in the narrative |
-| "no children" and "infertility" bars | not people: noted in the narrative |
+| "no children" and "infertility" bars | not people: no id or pedigree number, noted in the narrative |
 | carrier dot, presymptomatic line, P | noted in the narrative (Phenopackets have no field for them) |
 
 Relationships are written in the standard's reduced form: parents to their

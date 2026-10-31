@@ -254,6 +254,55 @@ def test_labels_become_ids_as_in_studio2ped():
     assert any("II-3's label" in w for w in r.warnings)
 
 
+def test_the_bars_have_no_number():
+    """The "no children" and "infertility" symbols are not people: as in Pedigree Studio (and studio2ped), they
+    have no number or label and do not count in their row, and a row with nothing but these symbols is not a
+    generation."""
+    person = lambda pid, shape, x, y, label="": {"id": pid, "shape": shape, "x": x, "y": y, "customLabel": label}
+    drawing = {"persons": [
+        person("f", "male", 100, 0), person("m", "female", 200, 0),
+        person("inf", "infertile", 0, 150, "from an older drawing"),
+        person("c1", "male", 100, 150, "Kid"), person("w", "female", 200, 150), person("c2", "female", 300, 150),
+        person("bar", "no-offspring", 150, 300), person("g", "male", 400, 450)],
+        "partnerships": [{"id": "pr", "fromId": "f", "toId": "m"}, {"id": "pr2", "fromId": "c1", "toId": "w"},
+                         {"id": "pr3", "fromId": "c2", "toId": "g"}],
+        "childLinks": [{"id": "l1", "partnershipId": "pr", "childId": "c1"},
+                       {"id": "l2", "partnershipId": "pr", "childId": "c2"},
+                       {"id": "l3", "partnershipId": "pr2", "childId": "bar"}]}
+    labels = {}
+    for mode in ("numbers", "letters", "lettersonly", "freetext"):
+        s = parse(dict(drawing, numberingMode=mode))
+        labels[mode] = s.drawing_labels()
+    assert labels["numbers"] == {"f": "I-1", "m": "I-2", "c1": "II-1", "w": "II-2", "c2": "II-3", "g": "III-1"}
+    assert labels["letters"] == {"f": "I-A", "m": "I-B", "c1": "II-A", "w": "II-B", "c2": "II-C", "g": "III-A"}
+    assert labels["lettersonly"] == {"f": "A", "m": "B", "c1": "C", "w": "D", "c2": "E", "g": "F"}
+    assert labels["freetext"] == dict(labels["numbers"], c1="Kid")
+    written = {}
+    for ids in ("numbers", "drawing", "studio"):
+        r = studio2ga4gh.convert(dict(drawing, numberingMode="freetext"), "t", ids=ids, created=CREATED)
+        ped, fam = loads(r.files[0][1]), loads(r.files[1][1])
+        assert errors(ped) == [] and errors(fam) == [], ids
+        written[ids] = {i["subject"]["id"] for i in ped["individuals"]}
+    assert written["numbers"] == set(labels["numbers"].values())
+    assert written["drawing"] == set(labels["freetext"].values())
+    assert written["studio"] == {"f", "m", "c1", "w", "c2", "g"}
+    r = studio2ga4gh.convert(drawing, "t", created=CREATED)
+    assert "II-1 and II-2: no children" in loads(r.files[0][1])["narrative"]
+
+
+def test_a_bar_joined_as_a_partner_is_not_a_couple():
+    """A bar has no id, so a partner line between it and someone is left out; the person's child keeps them."""
+    person = lambda pid, shape, x, y: {"id": pid, "shape": shape, "x": x, "y": y}
+    drawing = {"persons": [person("f", "male", 0, 0), person("bar", "no-offspring", 100, 0),
+                           person("bar2", "infertile", 200, 0), person("c", "female", 50, 150)],
+               "partnerships": [{"id": "pr", "fromId": "f", "toId": "bar"}, {"id": "pr2", "fromId": "bar2", "toId": "f"}],
+               "childLinks": [{"id": "l1", "partnershipId": "pr", "childId": "c"}]}
+    r = studio2ga4gh.convert(drawing, "t", created=CREATED)
+    ped = loads(r.files[0][1])
+    assert errors(ped) == [] and errors(loads(r.files[1][1])) == []
+    assert rels(ped) == {("I-1", "isBiologicalFatherOf", "II-1")}
+
+
 def test_names_are_never_written():
     for name in EXAMPLES + ["features"]:
         drawing = session(name)
