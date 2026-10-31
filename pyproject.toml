@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "studio2ga4gh"
-version = "0.4.0"
+version = "0.4.1"
 description = "Convert Pedigree Studio drawings to a GA4GH Pedigree and a Phenopackets Family"
 readme = "README.md"
 license = "MIT"
