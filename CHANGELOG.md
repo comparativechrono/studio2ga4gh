@@ -26,6 +26,16 @@ which Pedigree Studio now draws:
   halves and quarters do. (The Studio now also draws triplets and more from
   one point; their twin lines are read as before.)
 
+Pedigree numbers now skip the "no children" and "infertility" symbols. The
+nomenclature numbers individuals (Bennett et al., *J Genet Couns*
+2022;31(6):1238-48) and these symbols are not people, so Pedigree Studio now
+gives them no number, and studio2ga4gh numbers only people too, as studio2ped
+0.2.1 does: someone to the right of one of these symbols in the same row has a
+number one lower than before (II-3 rather than II-4), and a row with nothing
+but these symbols is not a generation. Letters and labels typed in skip them
+in the same way, and a partner line joining one of them to someone is not
+read as a couple.
+
 ## 0.4.0
 
 studio2ga4gh now writes its files through
