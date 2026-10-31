@@ -21,6 +21,10 @@ which Pedigree Studio now draws:
   third could come out non-identical when another twin in the set was not.
 - A consultand (an arrow without a P) is noted in the narrative, as carriers
   and pregnancies are: the GA4GH files have no place of their own for one.
+- A symbol divided into thirds, which the Studio now draws for three
+  conditions, gives each of its colours as a condition the person has, as
+  halves and quarters do. (The Studio now also draws triplets and more from
+  one point; their twin lines are read as before.)
 
 ## 0.4.0
 
